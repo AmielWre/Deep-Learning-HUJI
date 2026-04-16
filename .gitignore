@@ -1,0 +1,10 @@
+# Ignore all text data files
+*.txt
+
+# Ignore the specific data folder
+ex1/ex1 data/
+
+# Ignore Python/VS Code junk
+__pycache__/
+.vscode/
+.DS_Store
