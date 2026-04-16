@@ -1,5 +1,6 @@
 # Ignore the specific data folder
 ex1/ex1 data/
+ex1/results/
 
 # Ignore Python/VS Code junk
 __pycache__/

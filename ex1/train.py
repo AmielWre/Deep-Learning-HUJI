@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Tuple, List, Dict
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -21,22 +23,17 @@ from models import HLAMLPLinear, HLAMLPReLU
 
 # SARS-CoV-2 Spike protein sequence (1273 amino acids)
 SPIKE_PROTEIN = (
-    "MFVFLVLLPLVSSQCVNLTTRTQLPPAYTNSFTRGVYYPDKVFRSSVLHSTQDLFLPF"
-    "FSNVTWFHAIHVSGTNGTKRFDNPVLPFNDGVYFASTEKSNIIRGWIFGTTLDSKTQSLL"
-    "ILVNQFISNVFFQTVTDHGK"
-    "QYGDCLGDIAARDLICAQKFNGLTVLPPLLTDDMIAAYTAALVSGTAGAAAYYVGYLQPR"
-    "FFVKKSRSKAKLLKSKPQKKQQSAVDELDKAIAQQ"
-    "SLLLAKILLVVKQHSCKVSGSVVFPDA"
-    "KKASQRVAGDLSTAWNQQDGK"
-    "DSTPINNSVATVCSFNGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATV"
-    "CGSDDQTLPPLNDVSPLKQSRV"
-    "EDDLLKNGERQTLLGHFFAGQKKHTVPQAPALLSVFIFPPEDGETFTSSDVVPEQSIDQ"
-    "FVKQYGDCLGDIAARDLICAQKFNGLTVLPPLLTDDMIAAYTAALVSGTAGAAAYYVGYLQPR"
-    "FFVKKSRSKAKLLKSKPQKKQ"
-    "QSAVDELDKAIAQQLLEYLLEYLLEYLLEYLLEYLLEYLLEYLLEYLLEYLLEYLLEYLLEYLLEY"
-    "PLNDVSPLKQSRVEDDLLKNGERQTLLGHHFFAGQKKHTVPQAPALLSVF"
-    "IFPPEDGETFTSSDVVPEQSIDQFVKQ"
-    "KNGVYGFN"
+    "MFVFLVLLPLVSSQCVNLTTRTQLPPAYTNSFTRGVYYPDKVFRSSVLHSTQDLFLPFFSNVTWFHAIHVSGTNGTKRFDNPVLPFNDGVYFASTEKSNIIRGWIFGTTLDSKTQSLLIV"
+    "NNATNVVIKVCEFQFCNDPFLGVYYHKNNKSWMESEFRVYSSANNCTFEYVSQPFLMDLEGKQGNFKNLREFVFKNIDGYFKIYSKHTPINLVRDLPQGFSALEPLVDLPIGINITRFQT"
+    "LLALHRSYLTPGDSSSGWTAGAAAYYVGYLQPRTFLLKYNENGTITDAVDCALDPLSETKCTLKSFTVEKGIYQTSNFRVQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISN"
+    "CVADYSVLYNSASFSTFKCYGVSPTKLNDLCFTNVYADSFVIRGDEVRQIAPGQTGKIADYNYKLPDDFTGCVIAWNSNNLDSKVGGNYNYLYRLFRKSNLKPFERDISTEIYQAGSTPC"
+    "NGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATVCGPKKSTNLVKNKCVNFNFNGLTGTGVLTESNKKFLPFQQFGRDIADTTDAVRDPQTLEILDITPCSFGGVSVITP"
+    "GTNTSNQVAVLYQDVNCTEVPVAIHADQLTPTWRVYSTGSNVFQTRAGCLIGAEHVNNSYECDIPIGAGICASYQTQTNSPRRARSVASQSIIAYTMSLGAENSVAYSNNSIAIPTNFTI"
+    "SVTTEILPVSMTKTSVDCTMYICGDSTECSNLLLQYGSFCTQLNRALTGIAVEQDKNTQEVFAQVKQIYKTPPIKDFGGFNFSQILPDPSKPSKRSFIEDLLFNKVTLADAGFIKQYGDC"
+    "LGDIAARDLICAQKFNGLTVLPPLLTDEMIAQYTSALLAGTITSGWTFGAGAALQIPFAMQMAYRFNGIGVTQNVLYENQKLIANQFNSAIGKIQDSLSSTASALGKLQDVVNQNAQALN"
+    "TLVKQLSSNFGAISSVLNDILSRLDKVEAEVQIDRLITGRLQSLQTYVTQQLIRAAEIRAANLAATKMSECVLGQSKRVDFCGKGYHLMSFPQSAPHGVVFLHVTYVPAQEKNFTTAPA"
+    "ICHDGKAHFPREGVFVSNGTHWFVTQRNFYEPQIITTDNTFVSGNCDVVIGIVNNTVYDPLQPELDSFKEELDKYFKNHTSPDVDLGDISGINASVVNIQKEIDRLNEVAKNLNESLIDL"
+    "QELGKYEQYIKWPWYIWLGFIAGLIAIVMVTIMLCCMTSCCSCLKGCCSCGSCCKFDEDDSEPVLKGVKLHYT"
 )
 
 
@@ -409,7 +406,7 @@ def main():
         - Prints extensive diagnostic information.
     """
     # Setup paths
-    data_dir = Path(__file__).parent / 'ex1 data'
+    data_dir = Path(__file__).parent / 'ex1 data' / 'ex1 data'
     if not data_dir.exists():
         print(f"Error: Data directory not found at {data_dir}")
         return
@@ -418,23 +415,24 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Load datasets
+    # Load dataset once (contains both train and test splits)
     print("\n" + "="*60)
     print("LOADING DATA")
     print("="*60)
     
-    train_dataset = PeptideDataset(str(data_dir), split='train')
-    test_dataset = PeptideDataset(str(data_dir), split='test')
+    dataset = PeptideDataset(str(data_dir), test_ratio=0.1)
+    train_split = dataset.train_split
+    test_split = dataset.test_split
     
     # Print class distribution
     print("\nTrain set class distribution:")
-    train_dist = train_dataset.get_label_distribution()
+    train_dist = dataset.get_label_distribution(split='train')
     for label, count in sorted(train_dist.items()):
         alleles = ['A0101', 'A0201', 'A0203', 'A0207', 'A0301', 'A2402', 'Negative']
         print(f"  Class {label} ({alleles[label]}): {count}")
     
     print("\nTest set class distribution:")
-    test_dist = test_dataset.get_label_distribution()
+    test_dist = dataset.get_label_distribution(split='test')
     for label, count in sorted(test_dist.items()):
         alleles = ['A0101', 'A0201', 'A0203', 'A0207', 'A0301', 'A2402', 'Negative']
         print(f"  Class {label} ({alleles[label]}): {count}")
@@ -445,10 +443,10 @@ def main():
     print("="*60)
     
     # Use WeightedRandomSampler to handle class imbalance
-    class_weights = train_dataset.get_class_weights()
+    class_weights = dataset.get_class_weights(split='train')
     sample_weights = []
     
-    for label in train_dataset.labels[train_dataset.indices]:
+    for label in dataset.labels[dataset.train_indices]:
         sample_weights.append(class_weights[label].item())
     
     sampler = WeightedRandomSampler(
@@ -457,8 +455,8 @@ def main():
         replacement=True
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_split, batch_size=32, sampler=sampler)
+    test_loader = DataLoader(test_split, batch_size=32, shuffle=False)
     
     print(f"Train DataLoader: {len(train_loader)} batches of size 32")
     print(f"Test DataLoader: {len(test_loader)} batches of size 32")
@@ -500,11 +498,14 @@ def main():
     print("GENERATING VISUALIZATIONS")
     print("="*60)
     
-    plot_training_history(linear_history, save_path='linear_loss.png')
-    plot_accuracy(linear_history, save_path='linear_accuracy.png')
+    base_save_dir = Path(__file__).parent / 'results'
+    base_save_dir.mkdir(exist_ok=True)
     
-    plot_training_history(relu_history, save_path='relu_loss.png')
-    plot_accuracy(relu_history, save_path='relu_accuracy.png')
+    plot_training_history(linear_history, save_path=str(base_save_dir / 'linear_loss.png'))
+    plot_accuracy(linear_history, save_path=str(base_save_dir / 'linear_accuracy.png'))
+    
+    plot_training_history(relu_history, save_path=str(base_save_dir / 'relu_loss.png'))
+    plot_accuracy(relu_history, save_path=str(base_save_dir / 'relu_accuracy.png'))
     
     # ========== Spike Protein Analysis ==========
     print("\n" + "="*60)

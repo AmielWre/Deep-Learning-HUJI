@@ -35,9 +35,6 @@ def one_hot_encode_peptide(peptide: str) -> np.ndarray:
     Returns:
         np.ndarray: A 180-dimensional numpy array with values in {0, 1}.
     
-    Side Effects:
-        None
-    
     Raises:
         ValueError: If peptide is not exactly 9 characters.
         KeyError: If peptide contains invalid amino acids.
@@ -70,9 +67,6 @@ def load_sequences_from_file(file_path: str) -> List[str]:
     Returns:
         List[str]: List of peptide sequences.
     
-    Side Effects:
-        Reads from disk. No modifications to files.
-    
     Raises:
         FileNotFoundError: If the file does not exist.
     """
@@ -90,40 +84,31 @@ class PeptideDataset(Dataset):
     PyTorch Dataset for HLA peptide classification.
     
     Loads 9-mer sequences from positive and negative files, encodes them
-    as one-hot vectors, and assigns appropriate labels.
+    as one-hot vectors, and creates train/test splits.
     """
     
-    def __init__(self, data_dir: str, split: str = 'train', test_ratio: float = 0.1,
-                 random_seed: int = 42):
+    def __init__(self, data_dir: str, test_ratio: float = 0.1, random_seed: int = 42):
         """
-        Initialize the PeptideDataset.
+        Initialize the PeptideDataset and create train/test splits.
         
         Description:
             Loads all positive and negative peptide sequences from the specified
             directory, performs one-hot encoding, and creates a 90:10 train/test split.
+            Both splits are accessible via the train_split and test_split properties.
         
         Args:
             data_dir (str): Path to the directory containing the data files.
-            split (str): Either 'train' or 'test' to specify which split to load.
             test_ratio (float): Fraction of data to use for testing (default: 0.1 for 90:10 split).
             random_seed (int): Random seed for reproducibility (default: 42).
-        
-        Returns:
-            None
-        
+                
         Side Effects:
             - Reads files from disk during initialization.
             - Prints diagnostic information about loaded data.
         
         Raises:
-            ValueError: If split is not 'train' or 'test'.
             FileNotFoundError: If required data files are not found.
         """
-        if split not in ['train', 'test']:
-            raise ValueError(f"split must be 'train' or 'test', got {split}")
-        
         self.data_dir = Path(data_dir)
-        self.split = split
         self.random_seed = random_seed
         
         # Set random seed for reproducibility
@@ -143,6 +128,8 @@ class PeptideDataset(Dataset):
             'A0301_pos.txt': 4,
             'A2402_pos.txt': 5,
         }
+
+        neg_label = len(allele_files)
         
         # Load positive examples
         for filename, label in allele_files.items():
@@ -162,79 +149,50 @@ class PeptideDataset(Dataset):
         
         neg_sequences = load_sequences_from_file(str(neg_file))
         self.sequences.extend(neg_sequences)
-        self.labels.extend([6] * len(neg_sequences))
-        print(f"Loaded {len(neg_sequences)} sequences from negs.txt (label: 6)")
+        self.labels.extend([neg_label] * len(neg_sequences))
+        print(f"Loaded {len(neg_sequences)} sequences from negs.txt (label: {neg_label})")
         
         # Convert to numpy arrays for easier manipulation
         self.sequences = np.array(self.sequences)
         self.labels = np.array(self.labels)
         
-        # Create train/test split
+        # Create train/test split (once, with single shuffle)
         total_samples = len(self.sequences)
         indices = np.arange(total_samples)
         np.random.shuffle(indices)
         
         split_idx = int(total_samples * (1 - test_ratio))
         
-        if split == 'train':
-            self.indices = indices[:split_idx]
-        else:
-            self.indices = indices[split_idx:]
+        self.train_indices = indices[:split_idx]
+        self.test_indices = indices[split_idx:]
         
         print(f"\nDataset initialized:")
         print(f"  Total samples: {total_samples}")
-        print(f"  Train samples: {split_idx}")
-        print(f"  Test samples: {total_samples - split_idx}")
-        print(f"  Using {split} split with {len(self.indices)} samples")
+        print(f"  Train samples: {len(self.train_indices)}")
+        print(f"  Test samples: {len(self.test_indices)}")
+        
+        # Create split datasets
+        self.train_split = _PeptideSplit(self, self.train_indices, 'train')
+        self.test_split = _PeptideSplit(self, self.test_indices, 'test')
     
     def __len__(self) -> int:
-        """
-        Return the number of samples in the dataset.
-        
-        Returns:
-            int: Number of samples in the current split.
-        """
-        return len(self.indices)
+        """Return total number of samples (use len(dataset.train_split) or len(dataset.test_split))."""
+        return len(self.sequences)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        """
-        Get a single sample from the dataset.
-        
-        Description:
-            Retrieves a peptide sequence, encodes it as a one-hot vector,
-            and returns it with its label.
-        
-        Args:
-            idx (int): Index of the sample to retrieve.
-        
-        Returns:
-            Tuple[torch.Tensor, int]: A tuple of (encoded_peptide, label)
-                where encoded_peptide is a 180-dimensional tensor and label
-                is an integer in the range [0, 6].
-        
-        Side Effects:
-            None
-        """
-        actual_idx = self.indices[idx]
-        peptide = self.sequences[actual_idx]
-        label = self.labels[actual_idx]
-        
-        # One-hot encode the peptide
-        encoded = one_hot_encode_peptide(peptide)
-        encoded_tensor = torch.from_numpy(encoded).float()
-        
-        return encoded_tensor, label
+        """Direct access (use dataset.train_split[idx] or dataset.test_split[idx])."""
+        raise NotImplementedError("Use dataset.train_split or dataset.test_split")
     
-    def get_class_weights(self) -> torch.Tensor:
+    def get_class_weights(self, split='train') -> torch.Tensor:
         """
         Compute class weights for handling imbalanced data.
         
         Description:
-            Calculates inverse frequency weights for each class.
+            Calculates inverse frequency weights for each class in the specified split.
             Rare classes receive higher weights to improve model learning.
         
         Args:
-            None
+            split (str): Either 'train' or 'test' (default: 'train').
         
         Returns:
             torch.Tensor: Weight tensor of shape (7,), one weight per class.
@@ -242,7 +200,8 @@ class PeptideDataset(Dataset):
         Side Effects:
             None
         """
-        unique_labels, counts = np.unique(self.labels[self.indices], return_counts=True)
+        indices = self.train_indices if split == 'train' else self.test_indices
+        unique_labels, counts = np.unique(self.labels[indices], return_counts=True)
         weights = 1.0 / counts
         weights = weights / weights.sum() * len(unique_labels)
         
@@ -253,15 +212,15 @@ class PeptideDataset(Dataset):
         
         return class_weights
     
-    def get_label_distribution(self) -> Dict[int, int]:
+    def get_label_distribution(self, split='train') -> Dict[int, int]:
         """
-        Get the distribution of labels in the current split.
+        Get the distribution of labels in the specified split.
         
         Description:
-            Counts the number of samples for each class in the current split.
+            Counts the number of samples for each class in the split.
         
         Args:
-            None
+            split (str): Either 'train' or 'test' (default: 'train').
         
         Returns:
             Dict[int, int]: Dictionary mapping class labels to sample counts.
@@ -269,5 +228,84 @@ class PeptideDataset(Dataset):
         Side Effects:
             None
         """
-        unique_labels, counts = np.unique(self.labels[self.indices], return_counts=True)
+        indices = self.train_indices if split == 'train' else self.test_indices
+        unique_labels, counts = np.unique(self.labels[indices], return_counts=True)
         return {int(label): int(count) for label, count in zip(unique_labels, counts)}
+
+
+class _PeptideSplit(Dataset):
+    """
+    Internal helper class representing a single split (train or test) of PeptideDataset.
+    
+    Users should not instantiate this directly; access via dataset.train_split or dataset.test_split.
+    """
+    
+    def __init__(self, parent_dataset: PeptideDataset, indices: np.ndarray, split_name: str):
+        """
+        Initialize a split view of the parent dataset.
+        
+        Args:
+            parent_dataset (PeptideDataset): The parent dataset.
+            indices (np.ndarray): Indices for this split.
+            split_name (str): Name of split ('train' or 'test').
+        """
+        self.parent = parent_dataset
+        self.indices = indices
+        self.split_name = split_name
+    
+    def __len__(self) -> int:
+        """Return the number of samples in this split."""
+        return len(self.indices)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        """
+        Get a single sample from this split.
+        
+        Description:
+            Retrieves a peptide sequence, encodes it as a one-hot vector,
+            and returns it with its label.
+        
+        Args:
+            idx (int): Index within this split (0 to len(split)-1).
+        
+        Returns:
+            Tuple[torch.Tensor, int]: A tuple of (encoded_peptide, label)
+                where encoded_peptide is a 180-dimensional tensor and label
+                is an integer in the range [0, 6].
+        
+        Side Effects:
+            None
+        """
+        actual_idx = self.indices[idx]
+        peptide = self.parent.sequences[actual_idx]
+        label = self.parent.labels[actual_idx]
+        
+        # One-hot encode the peptide
+        encoded = one_hot_encode_peptide(peptide)
+        encoded_tensor = torch.from_numpy(encoded).float()
+        
+        return encoded_tensor, label
+    
+    def get_class_weights(self) -> torch.Tensor:
+        """
+        Compute class weights for this split.
+        
+        Description:
+            Delegates to parent dataset with the correct split name.
+        
+        Returns:
+            torch.Tensor: Weight tensor of shape (7,), one weight per class.
+        """
+        return self.parent.get_class_weights(split=self.split_name)
+    
+    def get_label_distribution(self) -> Dict[int, int]:
+        """
+        Get the distribution of labels in this split.
+        
+        Description:
+            Delegates to parent dataset with the correct split name.
+        
+        Returns:
+            Dict[int, int]: Dictionary mapping class labels to sample counts.
+        """
+        return self.parent.get_label_distribution(split=self.split_name)
