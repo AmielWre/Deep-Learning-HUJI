@@ -8,6 +8,7 @@ the SARS-CoV-2 Spike protein for peptides detectable by different HLA alleles.
 import os
 from pathlib import Path
 from typing import Tuple, List, Dict
+from xml.parsers.expat import model
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -207,8 +208,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, test_loader: DataLoa
         criterion = nn.CrossEntropyLoss()
     
     # Setup optimizer
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)     
     # Track metrics
     history = {
         'train_loss': [],
@@ -271,7 +271,7 @@ def plot_training_history(history: Dict[str, List[float]], save_path: str = None
         plt.savefig(save_path, dpi=150)
         print(f"Loss plot saved to {save_path}")
     
-    plt.show()
+    plt.close()
 
 
 def plot_accuracy(history: Dict[str, List[float]], save_path: str = None) -> None:
@@ -308,7 +308,7 @@ def plot_accuracy(history: Dict[str, List[float]], save_path: str = None) -> Non
         plt.savefig(save_path, dpi=150)
         print(f"Accuracy plot saved to {save_path}")
     
-    plt.show()
+    plt.close()
 
 
 def scan_spike_protein(model: nn.Module, device: torch.device,
@@ -482,7 +482,7 @@ def main():
     print("TRAINING RELU MODEL")
     print("="*60)
     
-    relu_model = HLAMLPReLU(dropout_rate=0.3)
+    relu_model = HLAMLPReLU(hidden_dims=[64, 64], dropout_rate=0.3)
     relu_history = train_model(
         relu_model,
         train_loader,
