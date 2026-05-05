@@ -27,18 +27,18 @@ class Encoder(nn.Module):
         # first_layer_channels = 15
         # -> input: (N, 1 (grey, not RGB), 28, 28) -> output: (N, 15, 14, 14)
         self.conv1 = nn.Conv2d(1, first_layer_channels, kernel_size, stride, padding)
-        self.cur_spatial = self._get_conv_output_size(self.cur_spatial_size, kernel_size, stride, padding)
+        self.cur_spatial_size = self._get_conv_output_size(self.cur_spatial_size, kernel_size, stride, padding)
         
         # --- Layer 2 ---
         # With the same parameters as above: input: (N, 15, 14, 14) -> output: (N, 30, 7, 7)
         self.conv2 = nn.Conv2d(first_layer_channels, first_layer_channels * 2, kernel_size, stride, padding)
-        self.cur_spatial = self._get_conv_output_size(self.cur_spatial, kernel_size, stride, padding)
+        self.cur_spatial_size = self._get_conv_output_size(self.cur_spatial_size, kernel_size, stride, padding)
         
         self.relu = nn.ReLU()
         
         # Save the final dimensions for the bottleneck
         self.final_channels = first_layer_channels * 2
-        self.final_spatial = self.cur_spatial
+        self.final_spatial = self.cur_spatial_size
         self.flatten_dim = self.final_channels * (self.final_spatial ** 2)
         # With the example parameters, flatten_dim = 30 * 7 * 7 = 1470, 
         # which is the size of the vector before the bottleneck.
@@ -72,51 +72,68 @@ class Encoder(nn.Module):
             torch.Tensor: Latent vectors of shape (N, latent_dim).
         """
         # Step 1: Pass through convolutions to get feature maps (N, C*2, 7, 7)
-        x = self.conv_layers(x)
+        # Layer 1
+        x = self.relu(self.conv1(x))
+        # Layer 2
+        x = self.relu(self.conv2(x))
         
-        # Step 2: Flatten the 3D cube into a 1D vector per image
+        # Flatten and project to latent space
         x = torch.flatten(x, start_dim=1)
-        
-        # Step 3: Project to the latent space d
-        latent = self.fc_latent(x)
-        return latent
+        return self.fc_latent(x)
 
 class Decoder(nn.Module):
     """
     Q1: Decoder model that reconstructs an image from a latent vector d.
-    It performs the inverse operations of the Encoder[cite: 1].
+    It performs the inverse operations of the Encoder using Transposed Convolutions.
     """
-    def __init__(self, latent_dim: int, last_layer_channels: int, 
-                 kernel_size: int = 3, stride: int = 2, padding: int = 1):
+    def __init__(self, 
+                 latent_dim: int, last_layer_channels: int,  kernel_size: int = 3, 
+                 stride: int = 2,  padding: int = 1, output_padding: int = 1,
+                 bottleneck_spatial: int = 7):
         """
         Args:
-            latent_dim (int): The size of the input latent vector (d)[cite: 1].
-            last_layer_channels (int): Channels in the layer before the final output[cite: 1].
+            latent_dim (int): The size of the input latent vector (d).
+            last_layer_channels (int): Channels in the layer before the final output.
             kernel_size (int): Size of the convolutional kernels.
             stride (int): Stride for the transposed convolutional layers.
             padding (int): Padding for the transposed convolutional layers.
+            output_padding (int): Additional size added to one side of the output shape.
+            bottleneck_spatial (int): The starting spatial size (e.g., 7 for MNIST).
         """
         super(Decoder, self).__init__()
         
-        self.channels = last_layer_channels
-        self.spatial = 7
-        self.flatten_dim = (last_layer_channels * 2) * self.spatial * self.spatial
+        # Track the spatial size dynamically as we "un-shrink" the image
+        self.cur_spatial = bottleneck_spatial
+        self.last_layer_channels = last_layer_channels
         
-        # Mapping the tiny vector back up to the size needed for 3D convolutions[cite: 1].
+        # Calculate the size needed to reconstruct the 3D volume from the 1D latent vector
+        self.flatten_dim = (last_layer_channels * 2) * (self.cur_spatial ** 2)
+        
+        # Step 1: Mapping the tiny vector back up to the flattened size
         self.fc_upscale = nn.Linear(latent_dim, self.flatten_dim)
         
-        self.deconv_layers = nn.Sequential(
-            # 7x7 -> 14x14 (upsampling via Transposed Convolution)[cite: 1]
-            nn.ConvTranspose2d(last_layer_channels * 2, last_layer_channels, 
-                               kernel_size=kernel_size, stride=stride, padding=padding, output_padding=1),
-            nn.ReLU(),
-            
-            # 14x14 -> 28x28
-            nn.ConvTranspose2d(last_layer_channels, 1, 
-                               kernel_size=kernel_size, stride=stride, padding=padding, output_padding=1),
-            # Final activation to keep pixels in [0, 1] range[cite: 1].
-            nn.Sigmoid() 
-        )
+        # --- Layer 1: 7x7 -> 14x14 ---
+        # Formula: (n-1)*s - 2*p + k + output_padding
+        self.deconv1 = nn.ConvTranspose2d(last_layer_channels * 2, last_layer_channels, 
+                                          kernel_size=kernel_size, stride=stride, 
+                                          padding=padding, output_padding=output_padding)
+        self.cur_spatial = self._get_deconv_output_size(self.cur_spatial, kernel_size, stride, padding, output_padding)
+        
+        # --- Layer 2: 14x14 -> 28x28 ---
+        self.deconv2 = nn.ConvTranspose2d(last_layer_channels, 1, 
+                                          kernel_size=kernel_size, stride=stride, 
+                                          padding=padding, output_padding=output_padding)
+        self.cur_spatial = self._get_deconv_output_size(self.cur_spatial, kernel_size, stride, padding, output_padding)
+        
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid() # Final pixels must be [0, 1]
+
+    def _get_deconv_output_size(self, n: int, kernel_size: int, stride: int, padding: int, output_padding: int) -> int:
+        """
+        Calculates the output spatial size after a Transposed Convolutional layer.
+        Formula: (n - 1) * stride - 2 * padding + kernel_size + output_padding
+        """
+        return (n - 1) * stride - 2 * padding + kernel_size + output_padding
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -128,27 +145,31 @@ class Decoder(nn.Module):
         Returns:
             torch.Tensor: Reconstructed images of shape (N, 1, 28, 28).
         """
-        # Step 1: Project d-vector back to high-dimensional vector[cite: 1]
+        # Step 1: Project d-vector back to high-dimensional vector
         x = self.fc_upscale(x)
         
-        # Step 2: Reshape back into a "cube" (N, Channels, 7, 7) for deconvolution[cite: 1]
-        x = x.view(-1, self.channels * 2, self.spatial, self.spatial)
+        # Step 2: Reshape back into a "cube" for deconvolution
+        # Example shape: (N, last_layer_channels * 2, 7, 7)
+        x = x.view(-1, self.last_layer_channels * 2, 7, 7)
         
-        # Step 3: Upscale to final 28x28 image
-        reconstruction = self.deconv_layers(x)
-        return reconstruction
+        # Step 3: Deconvolve and Upscale
+        x = self.relu(self.deconv1(x))
+        
+        # Step 4: Final reconstruction with Sigmoid
+        x = self.sigmoid(self.deconv2(x))
+        return x
 
 class ClassifierHead(nn.Module):
     """
-    Q2: Simple MLP to map the latent space to 10 digit classes (0-9)[cite: 1].
+    Q2: Simple MLP to map the latent space to 10 digit classes (0-9).
     """
     def __init__(self, latent_dim: int):
         """
         Args:
-            latent_dim (int): The size of the input latent vector (d)[cite: 1].
+            latent_dim (int): The size of the input latent vector (d).
         """
         super(ClassifierHead, self).__init__()
-        # A single linear layer mapping d to 10 class scores (logits)[cite: 1].
+        # A single linear layer mapping d to 10 class scores (logits).
         self.fc = nn.Linear(latent_dim, 10)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
