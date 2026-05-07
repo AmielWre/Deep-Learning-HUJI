@@ -82,6 +82,29 @@ def plot_combined_loss_curves(all_losses_data: dict, filename_prefix: str = "all
     plt.close()
     print(f"Combined loss curve saved: {filepath}")
 
+def save_models(encoder: nn.Module, decoder: nn.Module, latent_dim: int, first_layer_channels: int) -> None:
+    """
+    Saves encoder and decoder model weights to disk.
+    
+    Args:
+        encoder (nn.Module): Trained encoder model.
+        decoder (nn.Module): Trained decoder model.
+        latent_dim (int): The latent dimension used.
+        first_layer_channels (int): The first layer channels used.
+    """
+    results_dir = os.path.join(os.path.dirname(__file__), "ex2 results", "models")
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Save encoder weights
+    encoder_path = os.path.join(results_dir, f"encoder_d{latent_dim}_c{first_layer_channels}.pth")
+    torch.save(encoder.state_dict(), encoder_path)
+    print(f"Encoder weights saved: {encoder_path}")
+    
+    # Save decoder weights
+    decoder_path = os.path.join(results_dir, f"decoder_d{latent_dim}_c{first_layer_channels}.pth")
+    torch.save(decoder.state_dict(), decoder_path)
+    print(f"Decoder weights saved: {decoder_path}")
+
 def run_reconstruction_experiment() -> None:
     """
     Implements the first stage of the exercise: Training a convolutional autoencoder.
@@ -164,6 +187,9 @@ def run_reconstruction_experiment() -> None:
         # Store loss data for later plotting
         all_losses_data[config_name] = epoch_losses
         
+        # Save trained models
+        save_models(encoder, decoder, latent_dim, first_layer_channels)
+        
         # --- Final Visualization for this config ---
         encoder.eval()
         decoder.eval()
@@ -199,4 +225,5 @@ def run_reconstruction_experiment() -> None:
     plot_combined_loss_curves(all_losses_data, filename_prefix="all_configs")
 
 if __name__ == "__main__":
-    run_reconstruction_experiment()
+    print("hi")
+    #run_reconstruction_experiment()
