@@ -12,14 +12,15 @@ import os
 from datetime import datetime
 
 
-def load_pretrained_encoder(latent_dim: int, first_layer_channels: int, device: torch.device) -> Encoder:
+def load_pretrained_encoder(encoder_path: str, latent_dim: int, first_layer_channels: int, device: torch.device) -> Encoder:
     """
-    Loads a pre-trained encoder from Q1 weights.
+    Loads a pre-trained encoder from the specified path.
     
-    We retrieve the saved weights from the Q1 reconstruction experiment and
-    load them into a new encoder instance for use as a fixed feature extractor.
+    We retrieve the saved weights from disk and load them into a new encoder instance
+    for use as a fixed feature extractor.
     
     Args:
+        encoder_path (str): Full path to the encoder weights file (.pth).
         latent_dim (int): The latent dimension of the encoder.
         first_layer_channels (int): The first layer channels of the encoder.
         device (torch.device): Device to load the model on (CPU or GPU).
@@ -30,9 +31,6 @@ def load_pretrained_encoder(latent_dim: int, first_layer_channels: int, device: 
     in_channels = 1
     encoder = Encoder(in_channels=in_channels, latent_dim=latent_dim, 
                      first_layer_channels=first_layer_channels).to(device)
-    
-    models_dir = os.path.join(os.path.dirname(__file__), "ex2 results", "models")
-    encoder_path = os.path.join(models_dir, f"encoder_d{latent_dim}_c{first_layer_channels}.pth")
     
     if os.path.exists(encoder_path):
         encoder.load_state_dict(torch.load(encoder_path, map_location=device))
@@ -92,7 +90,9 @@ def run_classifier_training(use_pretrained: bool = False,
     # Initialize encoder
     if use_pretrained:
         print(f"Loading Pre-trained Encoder (latent_dim={latent_dim}, first_layer_channels={first_layer_channels}):")
-        encoder = load_pretrained_encoder(latent_dim, first_layer_channels, device)
+        models_dir = os.path.join(os.path.dirname(__file__), "ex2 results", "models")
+        encoder_path = os.path.join(models_dir, f"encoder_d{latent_dim}_c{first_layer_channels}.pth")
+        encoder = load_pretrained_encoder(encoder_path, latent_dim, first_layer_channels, device)
     else:
         print(f"Initializing Encoder from scratch (latent_dim={latent_dim}, first_layer_channels={first_layer_channels}):")
         encoder = Encoder(in_channels=in_channels, latent_dim=latent_dim, 
@@ -197,9 +197,61 @@ def run_classifier_training(use_pretrained: bool = False,
         'train_losses': train_losses,
         'test_losses': test_losses,
         'train_accuracies': train_accuracies,
-        'test_accuracies': test_accuracies
+        'test_accuracies': test_accuracies,
+        'encoder': encoder,
+        'classifier': classifier
     }
 
+
+def save_classifier_encoder(encoder: nn.Module, latent_dim: int, first_layer_channels: int, prefix: str = "classification") -> None:
+    """
+    Saves a classification-trained encoder to disk.
+    
+    This saves encoders trained for classification tasks (e.g., Q2)
+    so they can be used later for Q4 (task-specific reconstruction).
+    
+    Args:
+        encoder (nn.Module): Trained encoder model.
+        latent_dim (int): The latent dimension used.
+        first_layer_channels (int): The first layer channels used.
+        prefix (str): Prefix to distinguish encoder type (e.g., "classification").
+    """
+    results_dir = os.path.join(os.path.dirname(__file__), "ex2 results", "models")
+    os.makedirs(results_dir, exist_ok=True)
+    
+    encoder_path = os.path.join(results_dir, f"encoder_{prefix}_d{latent_dim}_c{first_layer_channels}.pth")
+    torch.save(encoder.state_dict(), encoder_path)
+    print(f"Classification encoder saved: {encoder_path}")
+
+def load_classifier_encoder(latent_dim: int, first_layer_channels: int, device: torch.device) -> Encoder:
+    """
+    Loads a pre-trained classification encoder (e.g., from Q2).
+    
+    Used by Q4 to load the encoder trained for classification tasks.
+    
+    Args:
+        latent_dim (int): The latent dimension of the encoder.
+        first_layer_channels (int): The first layer channels of the encoder.
+        device (torch.device): Device to load the model on (CPU or GPU).
+        
+    Returns:
+        Encoder: Classification-trained encoder model with loaded weights.
+    """
+    in_channels = 1
+    encoder = Encoder(in_channels=in_channels, latent_dim=latent_dim, 
+                     first_layer_channels=first_layer_channels).to(device)
+    
+    models_dir = os.path.join(os.path.dirname(__file__), "ex2 results", "models")
+    encoder_path = os.path.join(models_dir, f"encoder_classification_d{latent_dim}_c{first_layer_channels}.pth")
+    
+    if os.path.exists(encoder_path):
+        encoder.load_state_dict(torch.load(encoder_path, map_location=device))
+        print(f"Classification encoder loaded from: {encoder_path}")
+    else:
+        print(f"Warning: Classification encoder not found at {encoder_path}")
+        print(f"Please ensure Q2 has been run to generate the encoder.")
+    
+    return encoder
 
 def plot_reconstruction_results(losses: list[float], 
                                original_images: torch.Tensor, 
@@ -544,148 +596,8 @@ def plot_q3_results(train_losses: list[float],
     plt.close()
     print(f"Q3 Accuracy plot saved: {accuracy_filepath}")
 
-def write_q3_conclusion(q2_full: dict, q3_full: dict, q2_subset: dict, q3_subset: dict, batch_size: int) -> None:
-    """
-    Analyzes Q2 and Q3 results and writes conclusions about transfer learning.
-    
-    We compare the performance metrics between Q2 (training from scratch) and Q3
-    (using pre-trained encoder) to evaluate the usefulness of unsupervised representation learning.
-    
-    Args:
-        q2_full (dict): Q2 results on full dataset.
-        q3_full (dict): Q3 results on full dataset.
-        q2_subset (dict): Q2 results on 100 training examples.
-        q3_subset (dict): Q3 results on 100 training examples.
-        batch_size (int): Batch size used for training.
-    """
-    results_dir = os.path.join(os.path.dirname(__file__), "ex2 results")
-    os.makedirs(results_dir, exist_ok=True)
-    
-    conclusion_path = os.path.join(results_dir, "Q3_CONCLUSION.txt")
-    
-    with open(conclusion_path, 'w') as f:
-        f.write("=" * 80 + "\n")
-        f.write("EXERCISE 2 - QUESTION 3: CONCLUSIONS ON TRANSFER LEARNING\n")
-        f.write("=" * 80 + "\n\n")
-        
-        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Batch Size: {batch_size}\n\n")
-        
-        # Full Dataset Comparison
-        f.write("-" * 80 + "\n")
-        f.write("SCENARIO 1: FULL DATASET (60,000 training examples)\n")
-        f.write("-" * 80 + "\n\n")
-        
-        q2_final_test_acc = q2_full['test_accuracies'][-1]
-        q3_final_test_acc = q3_full['test_accuracies'][-1]
-        q2_final_test_loss = q2_full['test_losses'][-1]
-        q3_final_test_loss = q3_full['test_losses'][-1]
-        
-        f.write("Q2 (Training from Scratch):\n")
-        f.write(f"  Final Train Accuracy: {q2_full['train_accuracies'][-1]:.2f}%\n")
-        f.write(f"  Final Test Accuracy: {q2_final_test_acc:.2f}%\n")
-        f.write(f"  Final Test Loss: {q2_final_test_loss:.4f}\n\n")
-        
-        f.write("Q3 (Pre-trained Encoder, Frozen):\n")
-        f.write(f"  Final Train Accuracy: {q3_full['train_accuracies'][-1]:.2f}%\n")
-        f.write(f"  Final Test Accuracy: {q3_final_test_acc:.2f}%\n")
-        f.write(f"  Final Test Loss: {q3_final_test_loss:.4f}\n\n")
-        
-        acc_diff = q3_final_test_acc - q2_final_test_acc
-        loss_diff = q2_final_test_loss - q3_final_test_loss
-        
-        f.write("Comparison:\n")
-        f.write(f"  Accuracy Difference (Q3 - Q2): {acc_diff:+.2f}%\n")
-        f.write(f"  Loss Difference (Q2 - Q3): {loss_diff:+.4f}\n")
-        f.write(f"  Q3 is {'BETTER' if acc_diff > 0 else 'WORSE'} in final test accuracy\n\n")
-        
-        # Subset Comparison
-        f.write("-" * 80 + "\n")
-        f.write("SCENARIO 2: SMALL SUBSET (100 random training examples)\n")
-        f.write("-" * 80 + "\n\n")
-        
-        q2_subset_final_test_acc = q2_subset['test_accuracies'][-1]
-        q3_subset_final_test_acc = q3_subset['test_accuracies'][-1]
-        q2_subset_final_test_loss = q2_subset['test_losses'][-1]
-        q3_subset_final_test_loss = q3_subset['test_losses'][-1]
-        
-        f.write("Q2 (Training from Scratch):\n")
-        f.write(f"  Final Train Accuracy: {q2_subset['train_accuracies'][-1]:.2f}%\n")
-        f.write(f"  Final Test Accuracy: {q2_subset_final_test_acc:.2f}%\n")
-        f.write(f"  Final Test Loss: {q2_subset_final_test_loss:.4f}\n\n")
-        
-        f.write("Q3 (Pre-trained Encoder, Frozen):\n")
-        f.write(f"  Final Train Accuracy: {q3_subset['train_accuracies'][-1]:.2f}%\n")
-        f.write(f"  Final Test Accuracy: {q3_subset_final_test_acc:.2f}%\n")
-        f.write(f"  Final Test Loss: {q3_subset_final_test_loss:.4f}\n\n")
-        
-        acc_diff_subset = q3_subset_final_test_acc - q2_subset_final_test_acc
-        loss_diff_subset = q2_subset_final_test_loss - q3_subset_final_test_loss
-        
-        f.write("Comparison:\n")
-        f.write(f"  Accuracy Difference (Q3 - Q2): {acc_diff_subset:+.2f}%\n")
-        f.write(f"  Loss Difference (Q2 - Q3): {loss_diff_subset:+.4f}\n")
-        f.write(f"  Q3 is {'BETTER' if acc_diff_subset > 0 else 'WORSE'} in final test accuracy\n\n")
-        
-        # General Conclusions
-        f.write("=" * 80 + "\n")
-        f.write("CONCLUSIONS ON TRANSFER LEARNING / UNSUPERVISED REPRESENTATION LEARNING\n")
-        f.write("=" * 80 + "\n\n")
-        
-        f.write("1. IMPACT ON FULL DATASET TRAINING:\n")
-        if abs(acc_diff) < 2:
-            f.write(f"   With abundant data (60K examples), both approaches achieve similar performance.\n")
-            f.write(f"   The pre-trained encoder provides minimal advantage (diff: {acc_diff:+.2f}%).\n")
-        elif acc_diff > 0:
-            f.write(f"   Pre-trained encoder IMPROVES performance on full dataset ({acc_diff:+.2f}%).\n")
-            f.write(f"   This suggests useful representations were learned unsupervised.\n")
-        else:
-            f.write(f"   Training from scratch performs better on full dataset ({acc_diff:+.2f}%).\n")
-            f.write(f"   The reconstruction objective may not align with classification.\n")
-        
-        f.write("\n2. IMPACT ON LIMITED DATA SCENARIO:\n")
-        if acc_diff_subset > 5:
-            f.write(f"   Pre-trained encoder SIGNIFICANTLY OUTPERFORMS from-scratch training.\n")
-            f.write(f"   With only 100 examples, the pre-trained representation is crucial ({acc_diff_subset:+.2f}%).\n")
-            f.write(f"   STRONG evidence for the value of unsupervised representation learning.\n")
-        elif acc_diff_subset > 0:
-            f.write(f"   Pre-trained encoder shows modest benefit with limited data ({acc_diff_subset:+.2f}%).\n")
-            f.write(f"   Transfer learning helps avoid overfitting on small datasets.\n")
-        else:
-            f.write(f"   Both approaches struggle with 100 examples; pre-trained not beneficial.\n")
-            f.write(f"   The learned representations may be task-specific.\n")
-        
-        f.write("\n3. CONVERGENCE BEHAVIOR:\n")
-        q2_convergence = min(q2_full['test_accuracies'][-3:])
-        q3_convergence = min(q3_full['test_accuracies'][-3:])
-        f.write(f"   Q2 test accuracy (last 3 epochs): {q2_convergence:.2f}%\n")
-        f.write(f"   Q3 test accuracy (last 3 epochs): {q3_convergence:.2f}%\n")
-        
-        f.write("\n4. OVERALL ASSESSMENT OF UNSUPERVISED REPRESENTATION LEARNING:\n\n")
-        
-        if acc_diff_subset > 3:
-            f.write("   ✓ HIGHLY BENEFICIAL: The unsupervised pre-training is valuable,\n")
-            f.write("     especially in low-data regimes where it provides a strong prior.\n")
-            f.write("     The encoder learned meaningful features from reconstruction.\n")
-        elif acc_diff_subset > 0 or acc_diff > 2:
-            f.write("   ✓ MODERATELY BENEFICIAL: Transfer learning provides some advantage,\n")
-            f.write("     suggesting partial alignment between reconstruction and classification.\n")
-        else:
-            f.write("   ⚠ LIMITED BENEFIT: Pre-trained representations do not significantly\n")
-            f.write("     improve classification. Consider: (i) alternative pre-training tasks,\n")
-            f.write("     (ii) different architectures, or (iii) the reconstruction objective\n")
-            f.write("     may be misaligned with digit classification.\n")
-        
-        f.write("\n5. RECOMMENDATIONS:\n")
-        f.write("   - For small datasets (< 100 samples): strongly prefer transfer learning\n")
-        f.write("   - For large datasets: the benefit diminishes; consider task-specific training\n")
-        f.write("   - Consider hybrid approaches combining reconstruction and classification losses\n")
-        
-        f.write("\n" + "=" * 80 + "\n")
-    
-    print(f"Conclusion written to: {conclusion_path}")
 
-def run_classifier_experiment() -> dict:
+def run_classifier_from_scratch() -> dict:
     """
     Question 2: Training classifiers from scratch (Q2).
     
@@ -747,9 +659,20 @@ def run_classifier_experiment() -> dict:
         scenario_name="q2_subset"
     )
     
+    # Save Q2 encoder (full dataset version only) for Q4 use
+    print(f"\nSaving Q2 encoder for Q4 (Task-Specific Encoding)...")
+    latent_dim = 16
+    first_layer_channels = 15
+    save_classifier_encoder(
+        results['q2_full']['encoder'],
+        latent_dim=latent_dim,
+        first_layer_channels=first_layer_channels,
+        prefix="classification"
+    )
+    
     return results
 
-def run_q3_experiment(q2_results: dict = None) -> dict:
+def run_classifier_pre_trained(q2_results: dict = None) -> dict:
     """
     Question 3: Transfer learning with pre-trained encoder (Q3).
     
@@ -820,28 +743,16 @@ def run_q3_experiment(q2_results: dict = None) -> dict:
         scenario_name="q3_subset"
     )
     
-    # If Q2 results are provided, write comprehensive conclusion
-    if q2_results is not None:
-        print(f"\nGenerating conclusions with Q2 comparison...")
-        write_q3_conclusion(
-            q2_results['q2_full'],
-            results['q3_full'],
-            q2_results['q2_subset'],
-            results['q3_subset'],
-            batch_size=batch_size
-        )
-    else:
-        print(f"\nNote: Q2 results not provided. Skipping Q2 vs Q3 comparison analysis.")
-    
     return results
 
 if __name__ == "__main__":
     # Uncomment to run Q1 (Autoencoder reconstruction)
-    # run_reconstruction_experiment()
+    run_reconstruction_experiment()
     
     # Run Q2 and Q3 with comparison
-    # q2_results = run_classifier_experiment()  # Q2: Train from scratch
-    q3_results = run_q3_experiment()  # Q3: Transfer learning
+    # q2_results = run_classifier_from_scratch()  # Q2: Train from scratch
+    # q3_results = run_classifier_pre_trained()  # Q3: Transfer learning. Note that you
+    # need to have the pre-trained encoder weights from Q1 for this to work properly.
     
     print(f"\n{'='*70}")
     print("All experiments completed. Check 'ex2 results' folder for outputs.")
