@@ -12,3 +12,15 @@ venv/
 
 # Ignore all PDF files
 **/*.pdf
+
+
+# Ignore the GloVe downloads cache folder
+.vector_cache/
+
+# Ignore the heavy IMDB dataset CSV file
+ex3/provided files/IMDB Dataset.csv
+ex3/provided\ files/IMDB\ Dataset.csv
+*.csv
+
+# Ignore saved model weight artifacts
+*.pth

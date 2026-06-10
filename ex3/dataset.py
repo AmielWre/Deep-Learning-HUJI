@@ -1,476 +1,406 @@
-"""Dataset and vocabulary utilities for Exercise 3.
+"""Dataset and text-vectorization utilities .
 
-The code in this module keeps tensors in the assignment convention:
-``N_batch x N_word x N_features`` for embedded batches and
-``N_batch x N_word`` for integer token batches.
+This file converts the raw IMDB CSV (or any other CSV with similar structure) into PyTorch batches ready for the models.
+The public entry point is ``get_data_loaders()``, which is called from
+``main.py``. The call flow is:
 
-Args:
-    None.
+``main.py`` -> ``get_data_loaders()`` -> ``load_records()`` -> ``_rows_to_records()``
+-> ``ReviewRecord`` objects -> ``IMDBReviewDataset`` -> ``DataLoader`` ->
+``SentimentCollator`` -> ``Batch``.
 
-Returns:
-    None.
+Classes:
+    ``ReviewRecord``:
+        Stores one raw example: review text, numeric label, and ``split_name``.
+        This is for using record.review/label/split_name instead of record[0]/[1]/[2].
+        Normal IMDB rows use ``split_name="imdb"``; custom diagnostic rows use
+        names such as ``TP``, ``FN``, or ``NEGATION_POS`` so diagnostics can find
+        them later. See ``config.CUSTOM_DIAGNOSTIC_REVIEWS`` 
+    ``Batch``:
+        Stores one mini-batch returned by the DataLoader. It contains labels,
+        padded embeddings, padding masks, token lists, and split names.
+    ``TextVectorizer``:
+        The embedding maker.
+        Loads GloVe and converts token lists into fixed-size tensors. Short
+        reviews are padded with zero vectors here.
+    ``IMDBReviewDataset``:
+        A thin PyTorch ``Dataset`` wrapper around a list of ``ReviewRecord``
+        objects.
+    ``SentimentCollator``:
+        Converts a list of ``ReviewRecord`` objects into one ``Batch`` by
+        cleaning, tokenizing, embedding, padding, and stacking examples.
 
-Raises:
-    FileNotFoundError: If required local dataset or GloVe files are missing.
+Shape conventions:
+    labels:
+        ``[batch_size]`` integer labels, where 0 is negative and 1 is positive.
+    embeddings:
+        ``[batch_size, MAX_LENGTH, EMBEDDING_SIZE]``. With the assignment
+        default this is ``[batch_size, 100, 100]``.
+    mask:
+        ``[batch_size, MAX_LENGTH]``. Real token positions are 1.0 and padding
+        positions are 0.0. Models use this mask to ignore padded zero vectors
+        during pooling or recurrent updates.
+
+The ``MAX_LENGTH`` rule is applied in ``tokenize()`` with
+``split()[:max_length]``. Padding happens later in ``TextVectorizer.encode()``:
+it first creates zero tensors of length ``MAX_LENGTH``, then fills the first
+positions with GloVe vectors for the real tokens.
 """
 
 from __future__ import annotations
 
-import random
 import re
-from collections import Counter
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Sequence
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+from torchtext.vocab import GloVe
+
+import config
 
 
-TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|[0-9]+|[^\sA-Za-z0-9]")
+TOKEN_PATTERN: re.Pattern[str] = re.compile(r"[^A-Za-z]+")
+SPACE_PATTERN: re.Pattern[str] = re.compile(r"\s+")
 
 
-# === SHARED DATA UTILITIES ===
-
-
-def tokenize(text: str) -> list[str]:
-    """Tokenizes a movie review into lowercase tokens.
-
-    Args:
-        text: Raw review text.
-
-    Returns:
-        A list of lowercase tokens.
-
-    Raises:
-        TypeError: If ``text`` is not a string.
-    """
-    if not isinstance(text, str):
-        raise TypeError("text must be a string.")
-    return TOKEN_RE.findall(text.lower())
-
-
-@dataclass(frozen=True)
-class Vocabulary:
-    """Maps tokens to integer ids and back.
+class ReviewRecord:
+    """Container for one raw review and its class label.
 
     Args:
-        token_to_id: Mapping from token string to integer id.
-        pad_token: Token used for padding.
-        unk_token: Token used for unknown words.
-
-    Returns:
-        None.
-
-    Raises:
-        ValueError: If required special tokens are absent.
+        review: Raw review text.
+        label: Integer label where 0 is negative and 1 is positive.
+        split_name: Optional source marker used by diagnostics.
     """
 
-    token_to_id: dict[str, int]
-    pad_token: str = "<pad>"
-    unk_token: str = "<unk>"
+    def __init__(self, review: str, label: int, split_name: str = "imdb") -> None:
+        self.review = review
+        self.label = label
+        self.split_name = split_name
 
-    def __post_init__(self) -> None:
-        """Validates the vocabulary special tokens.
 
-        Args:
-            None.
+class Batch:
+    """Mini-batch returned by the custom collate function.
 
-        Returns:
-            None.
+    Args:
+        labels: Tensor of integer class labels with shape ``[batch]``. 1 for positive, 0 for negative.
+        embeddings: Embedded reviews with shape ``[batch, seq_len, emb_dim]``.
+        mask: Float mask with shape ``[batch, seq_len]`` where real tokens are 1 and padding tokens are 0.
+        tokens: Original token lists after cleaning and truncation.
+        split_names: Source markers for each row.
+    """
 
-        Raises:
-            ValueError: If the padding or unknown token is missing.
-        """
-        if self.pad_token not in self.token_to_id:
-            raise ValueError("pad_token is missing from token_to_id.")
-        if self.unk_token not in self.token_to_id:
-            raise ValueError("unk_token is missing from token_to_id.")
+    def __init__(
+        self,
+        labels: torch.Tensor,
+        embeddings: torch.Tensor,  # e.g. for embedding: [[[0.1, 0.2, ...], [0.3, 0.4, ... (emb_dim)], ... (seq_len)], [[0.5, 0.6, ...], [0.7, 0.8, ...], ...], ... (batch)]
+        mask: torch.Tensor,  # e.g. for mask: [[1, 1, 1, 0, 0, ... (seq_len)], [1, 1, 0, 0, ...], ... (batch)]
+        tokens: list[list[str]],  # List of token lists with length ``batch`` and inner lists of length at most ``seq_len``. e.g. [["a", "good", "movie", ...], ["bad", "film", "that", "i", "hated", ...], ...]
+        split_names: list[str],  # List of source markers with length ``batch``. e.g. ["imdb", "imdb", "custom_tp", "custom_fn", ...] (custom for manual diagnostics, see config.CUSTOM_DIAGNOSTIC_REVIEWS, imdb for regular samples)
+    ) -> None:
+        self.labels = labels
+        self.embeddings = embeddings
+        self.mask = mask
+        self.tokens = tokens
+        self.split_names = split_names
 
-    @property
-    def pad_id(self) -> int:
-        """Returns the padding id.
-
-        Args:
-            None.
-
-        Returns:
-            The integer id of the padding token.
-
-        Raises:
-            None.
-        """
-        return self.token_to_id[self.pad_token]
-
-    @property
-    def unk_id(self) -> int:
-        """Returns the unknown-token id.
+    def to(self, device: torch.device) -> "Batch":
+        """Move tensor fields to the requested device.
 
         Args:
-            None.
+            device: Target PyTorch device.
 
         Returns:
-            The integer id of the unknown token.
+            The same batch instance with tensor fields moved in-place.
+        """
+
+        self.labels = self.labels.to(device)
+        self.embeddings = self.embeddings.to(device)
+        self.mask = self.mask.to(device)
+        return self
+
+
+def clean_review(text: str) -> str:
+    """Normalize a movie review before tokenization.
+
+    Args:
+        text: Raw input review.
+
+    Returns:
+        Lower-cased alphabetic text with collapsed spaces.
+
+    Examples:
+        - "This movie is <b>great</b>! Check it out: https://example.com" ->
+          "this movie is great check it out"
+        - "A    bad movie with 1 star." -> "a bad movie with star"
+        - "Not a good movie." -> "not good movie"
+        - "A film with a single letter title: X." -> "a film with single letter title"
+        - " I hate this movie! " -> "i hate this movie"
+    """
+
+    text = re.sub(r"https?://\S+", " ", text)
+    text = text.replace("<br />", " ")
+    text = TOKEN_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+[A-Za-z]\s+", " ", text)
+    return SPACE_PATTERN.sub(" ", text).strip().lower()
+
+
+def tokenize(text: str, max_length: int = config.MAX_LENGTH) -> list[str]:
+    """Clean, split, and truncate a review.
+
+    Args:
+        text: Raw input review.
+        max_length: Maximum number of tokens to keep.
+
+    Returns:
+        A token list of length at most ``max_length``.
+    """
+
+    return clean_review(text).split()[:max_length]
+
+
+class TextVectorizer:
+    """Convert token lists into fixed-size embedding tensors.
+
+    The vectorizer requires torchtext GloVe vectors. Missing torchtext 
+    or unavailable GloVe vectors are treated as setup errors rather than
+    silently changing the representation.
+
+    Args:
+        embedding_size: Token vector width.
+        max_length: Number of sequence positions per review.
+
+    Raises:
+        ValueError: If ``embedding_size`` or ``max_length`` are not positve.
+        RuntimeError: If torchtext GloVe cannot be loaded.
+    """
+
+    def __init__(self, embedding_size: int, max_length: int) -> None:
+        if embedding_size <= 0 or max_length <= 0:
+            raise ValueError("embedding_size and max_length must be positve.")
+        self.embedding_size = embedding_size
+        self.max_length = max_length
+        self._cache: dict[str, torch.Tensor] = {}
+        self._glove = self._load_glove()
+
+    def encode(self, tokens: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed and pad a token sequence.
+
+        Args:
+            tokens: Clean token sequence.
+
+        Returns:
+            A pair ``(embeddings, mask)`` with shapes
+            ``[max_length, embedding_size]`` and ``[max_length]``.
+        """
+
+        embeddings = torch.zeros(self.max_length, self.embedding_size, dtype=torch.float32)  # Padding is here.
+        mask = torch.zeros(self.max_length, dtype=torch.float32)
+        for index, token in enumerate(tokens[: self.max_length]):
+            embeddings[index] = self._token_vector(token)
+            mask[index] = 1.0
+        return embeddings, mask
+
+    def _load_glove(self) -> object:
+        """Load required GloVe vectors.
+
+        Returns:
+            A torchtext GloVe object.
 
         Raises:
-            None.
+            RuntimeError: If torchtext or the requested GloVe vectors are
+                unavailable.
         """
-        return self.token_to_id[self.unk_token]
+
+        try:
+            return GloVe(name="6B", dim=self.embedding_size)
+        except Exception as error:
+            raise RuntimeError(
+                "Failed to load torchtext GloVe vectors. Install torchtext and "
+                "make sure GloVe 6B vectors are available before running."
+            ) from error
+
+    def _token_vector(self, token: str) -> torch.Tensor:
+        """Return a cached vector for one token.
+
+        Args:
+            token: Clean token string.
+
+        Returns:
+            A one-dimensional embedding tensor.
+        """
+
+        if token in self._cache:
+            return self._cache[token]
+        vector = self._glove.get_vecs_by_tokens([token]).squeeze(0).float()
+        self._cache[token] = vector
+        return vector
+
+
+class IMDBReviewDataset(Dataset[ReviewRecord]):
+    """PyTorch dataset for raw IMDB review records.
+
+    Args:
+        records: Sequence of review records.
+    """
+
+    def __init__(self, records: Sequence[ReviewRecord]) -> None:
+        self.records = list(records)
 
     def __len__(self) -> int:
-        """Returns the vocabulary size.
+        """Return the number of records."""
+
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> ReviewRecord:
+        """Fetch one record.
 
         Args:
-            None.
+            index: Dataset index.
 
         Returns:
-            Number of vocabulary entries.
-
-        Raises:
-            None.
+            A ``ReviewRecord``.
         """
-        return len(self.token_to_id)
 
-    def encode(self, tokens: Sequence[str], max_len: int) -> tuple[list[int], list[int]]:
-        """Encodes tokens as padded ids and an attention mask.
+        return self.records[index]
+
+
+class SentimentCollator:
+    """Collate raw review records into tensors.
+
+    Args:
+        vectorizer: Text vectorizer used for token embeddings.
+    """
+
+    def __init__(self, vectorizer: TextVectorizer) -> None:
+        self.vectorizer = vectorizer
+
+    def __call__(self, records: Sequence[ReviewRecord]) -> Batch:
+        """Build one mini-batch.
 
         Args:
-            tokens: Token sequence.
-            max_len: Maximum encoded sequence length.
+            records: Raw review records sampled by a DataLoader.
 
         Returns:
-            A tuple ``(ids, mask)`` with both lists of length ``max_len``.
-
-        Raises:
-            ValueError: If ``max_len`` is not positive.
+            A tensorized ``Batch``.
         """
-        if max_len <= 0:
-            raise ValueError("max_len must be positive.")
-        clipped = list(tokens[:max_len])
-        ids = [self.token_to_id.get(token, self.unk_id) for token in clipped]
-        mask = [1] * len(ids)
-        pad_count = max_len - len(ids)
-        ids.extend([self.pad_id] * pad_count)
-        mask.extend([0] * pad_count)
-        return ids, mask
 
-    def decode(self, ids: Sequence[int], mask: Sequence[int] | None = None) -> list[str]:
-        """Decodes ids into token strings.
-
-        Args:
-            ids: Integer token ids.
-            mask: Optional mask where ``0`` positions are skipped.
-
-        Returns:
-            Decoded token strings.
-
-        Raises:
-            None.
-        """
-        id_to_token = {idx: token for token, idx in self.token_to_id.items()}
-        tokens: list[str] = []
-        for index, token_id in enumerate(ids):
-            if mask is not None and int(mask[index]) == 0:
-                continue
-            tokens.append(id_to_token.get(int(token_id), self.unk_token))
-        return tokens
+        labels: list[int] = []
+        token_lists: list[list[str]] = []
+        split_names: list[str] = []
+        embeddings: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
+        for record in records:
+            tokens = tokenize(record.review)
+            review_embeddings, mask = self.vectorizer.encode(tokens)
+            labels.append(record.label)
+            token_lists.append(tokens)
+            split_names.append(record.split_name)
+            embeddings.append(review_embeddings)
+            masks.append(mask)
+        return Batch(
+            labels=torch.tensor(labels, dtype=torch.long),
+            embeddings=torch.stack(embeddings),
+            mask=torch.stack(masks),
+            tokens=token_lists,
+            split_names=split_names,
+        )
 
 
-def build_vocabulary(
-    tokenized_texts: Iterable[Sequence[str]],
-    max_vocab_size: int = 30_000,
-    min_freq: int = 2,
-) -> Vocabulary:
-    """Builds a vocabulary from tokenized texts.
+def load_records(
+    dataset_path: Path = config.DATASET_PATH,
+    include_custom_diagnostics: bool = False,
+) -> list[ReviewRecord]:
+    """Load IMDB records from disk into Pandas DataFrame and then convert them to review records list.
 
     Args:
-        tokenized_texts: Iterable of token sequences.
-        max_vocab_size: Maximum number of tokens including special tokens.
-        min_freq: Minimum frequency required for a token to be included.
+        dataset_path: Path to the IMDB CSV file.
+        include_custom_diagnostics: Whether to append the configured custom
+            diagnostic reviews using ``pd.concat``.
 
     Returns:
-        A ``Vocabulary`` instance.
+        A list of review records.
 
     Raises:
-        ValueError: If ``max_vocab_size`` is smaller than two or ``min_freq`` is negative.
+        FileNotFoundError: If the CSV file is missing.
+        ModuleNotFoundError: If pandas is not installed.
+        ValueError: If a sentiment label is unknown.
     """
-    if max_vocab_size < 2:
-        raise ValueError("max_vocab_size must be at least 2.")
-    if min_freq < 0:
-        raise ValueError("min_freq cannot be negative.")
 
-    counter: Counter[str] = Counter()
-    for tokens in tokenized_texts:
-        counter.update(tokens)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Missing dataset file: {dataset_path}")
 
-    token_to_id = {"<pad>": 0, "<unk>": 1}
-    for token, count in counter.most_common(max_vocab_size - 2):
-        if count < min_freq:
-            continue
-        token_to_id[token] = len(token_to_id)
-    return Vocabulary(token_to_id=token_to_id)
+    data = pd.read_csv(dataset_path)
+    data = data[["review", "sentiment"]].copy()
+    data["split_name"] = "imdb"
+    if include_custom_diagnostics:
+        custom_data = pd.DataFrame(
+            {
+                "review": [text for _, text, _ in config.CUSTOM_DIAGNOSTIC_REVIEWS],
+                "sentiment": [label for _, _, label in config.CUSTOM_DIAGNOSTIC_REVIEWS],
+                "split_name": [name for name, _, _ in config.CUSTOM_DIAGNOSTIC_REVIEWS],
+            }
+        )
+        data = pd.concat([data, custom_data], ignore_index=True)
+    return _rows_to_records(
+        data[["review", "sentiment", "split_name"]].itertuples(index=False, name=None)
+    )
 
 
-def load_imdb_split(root: Path, split: str) -> list[tuple[str, int]]:
-    """Loads an IMDB split from the standard ``aclImdb`` directory layout.
+def get_data_loaders() -> tuple[DataLoader[Batch], DataLoader[Batch], TextVectorizer]:
+    """Create train/test loaders from ``config.py`` only.
+
+    Returns:
+        Train loader, test loader, and the shared vectorizer.
+    """
+
+    all_records: list[ReviewRecord] = load_records(
+        include_custom_diagnostics=config.USE_CUSTOM_DIAGNOSTICS_IN_TEST
+    )
+    train_records = all_records[: config.TRAIN_SIZE]
+    test_records = all_records[config.TRAIN_SIZE :]
+    vectorizer = TextVectorizer(config.EMBEDDING_SIZE, config.MAX_LENGTH)
+    collator = SentimentCollator(vectorizer)
+    train_loader: DataLoader[Batch] = DataLoader(
+        IMDBReviewDataset(train_records),
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=collator,
+    )
+    test_loader: DataLoader[Batch] = DataLoader(
+        IMDBReviewDataset(test_records),
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+        collate_fn=collator,
+    )
+    return train_loader, test_loader, vectorizer
+
+
+def _rows_to_records(rows: Iterable[tuple[str, str, str]]) -> list[ReviewRecord]:
+    """Convert raw CSV rows into typed records.
 
     Args:
-        root: Path to the ``aclImdb`` directory.
-        split: Split name, either ``"train"`` or ``"test"``.
+        rows: Iterable of ``(review, sentiment, split_name)`` tuples.
 
     Returns:
-        A list of ``(review_text, label)`` pairs where label ``1`` is positive.
+        Parsed review records.
 
     Raises:
-        FileNotFoundError: If the split directories do not exist.
-        ValueError: If ``split`` is unsupported.
-    """
-    if split not in {"train", "test"}:
-        raise ValueError("split must be 'train' or 'test'.")
-    examples: list[tuple[str, int]] = []
-    for sentiment, label in (("neg", 0), ("pos", 1)):
-        folder = root / split / sentiment
-        if not folder.exists():
-            raise FileNotFoundError(f"Missing IMDB folder: {folder}")
-        for path in sorted(folder.glob("*.txt")):
-            examples.append((path.read_text(encoding="utf-8", errors="replace"), label))
-    return examples
-
-
-def make_smoke_test_examples() -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    """Creates a tiny deterministic sentiment dataset for smoke tests.
-
-    Args:
-        None.
-
-    Returns:
-        Train and test examples with IMDB-like binary labels.
-
-    Raises:
-        None.
-    """
-    train = [
-        ("this movie is good and enjoyable", 1),
-        ("a wonderful film with great acting", 1),
-        ("not boring and surprisingly good", 1),
-        ("this movie is bad and boring", 0),
-        ("a terrible film with awful acting", 0),
-        ("not good and painfully dull", 0),
-    ]
-    test = [
-        ("good acting and enjoyable story", 1),
-        ("bad acting and boring story", 0),
-        ("not boring", 1),
-        ("not good", 0),
-    ]
-    return train, test
-
-
-class IMDBReviewDataset(Dataset[dict[str, torch.Tensor | list[str]]]):
-    """PyTorch dataset for tokenized IMDB reviews.
-
-    Args:
-        examples: Review and label pairs.
-        vocab: Vocabulary used for encoding.
-        max_len: Maximum token sequence length.
-
-    Returns:
-        None.
-
-    Raises:
-        ValueError: If ``max_len`` is not positive.
+        ValueError: If a sentiment label is unknown.
     """
 
-    def __init__(self, examples: Sequence[tuple[str, int]], vocab: Vocabulary, max_len: int) -> None:
-        """Initializes the dataset.
-
-        Args:
-            examples: Review and label pairs.
-            vocab: Vocabulary used for encoding.
-            max_len: Maximum token sequence length.
-
-        Returns:
-            None.
-
-        Raises:
-            ValueError: If ``max_len`` is not positive.
-        """
-        if max_len <= 0:
-            raise ValueError("max_len must be positive.")
-        self.examples = list(examples)
-        self.vocab = vocab
-        self.max_len = max_len
-
-    def __len__(self) -> int:
-        """Returns the number of examples.
-
-        Args:
-            None.
-
-        Returns:
-            Dataset length.
-
-        Raises:
-            None.
-        """
-        return len(self.examples)
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | list[str]]:
-        """Returns a single encoded review example.
-
-        Args:
-            index: Example index.
-
-        Returns:
-            Dictionary with ``input_ids``, ``attention_mask``, ``label``, and ``tokens``.
-
-        Raises:
-            IndexError: If ``index`` is outside the dataset.
-        """
-        text, label = self.examples[index]
-        tokens = tokenize(text)
-        ids, mask = self.vocab.encode(tokens, self.max_len)
-        return {
-            "input_ids": torch.tensor(ids, dtype=torch.long),
-            "attention_mask": torch.tensor(mask, dtype=torch.float32),
-            "label": torch.tensor(label, dtype=torch.long),
-            "tokens": tokens[: self.max_len],
-        }
-
-
-def collate_reviews(batch: Sequence[dict[str, torch.Tensor | list[str]]]) -> dict[str, torch.Tensor | list[list[str]]]:
-    """Collates encoded reviews into a mini-batch.
-
-    Args:
-        batch: Sequence of dataset items.
-
-    Returns:
-        Batched tensors and token lists.
-
-    Raises:
-        ValueError: If ``batch`` is empty.
-    """
-    if not batch:
-        raise ValueError("batch cannot be empty.")
-    return {
-        "input_ids": torch.stack([item["input_ids"] for item in batch if isinstance(item["input_ids"], torch.Tensor)]),
-        "attention_mask": torch.stack(
-            [item["attention_mask"] for item in batch if isinstance(item["attention_mask"], torch.Tensor)]
-        ),
-        "label": torch.stack([item["label"] for item in batch if isinstance(item["label"], torch.Tensor)]),
-        "tokens": [item["tokens"] for item in batch if isinstance(item["tokens"], list)],
-    }
-
-
-def load_glove_embeddings(
-    glove_path: Path | None,
-    vocab: Vocabulary,
-    embedding_dim: int,
-    seed: int = 17,
-) -> torch.Tensor:
-    """Loads a frozen embedding matrix from a GloVe text file.
-
-    Args:
-        glove_path: Path to a GloVe ``.txt`` file, or ``None`` for a smoke-test matrix.
-        vocab: Vocabulary whose rows should be initialized.
-        embedding_dim: Expected embedding dimension.
-        seed: Random seed used for missing words.
-
-    Returns:
-        Tensor with shape ``N_vocab x N_features``.
-
-    Raises:
-        FileNotFoundError: If ``glove_path`` is provided but absent.
-        ValueError: If ``embedding_dim`` is not positive or the GloVe file has incompatible rows.
-    """
-    if embedding_dim <= 0:
-        raise ValueError("embedding_dim must be positive.")
-    generator = torch.Generator().manual_seed(seed)
-    matrix = torch.empty(len(vocab), embedding_dim).uniform_(-0.05, 0.05, generator=generator)
-    matrix[vocab.pad_id].zero_()
-
-    if glove_path is None:
-        return matrix
-    if not glove_path.exists():
-        raise FileNotFoundError(f"GloVe file not found: {glove_path}")
-
-    wanted = set(vocab.token_to_id)
-    with glove_path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            parts = line.rstrip().split(" ")
-            if len(parts) <= 2:
-                continue
-            token = parts[0]
-            if token not in wanted:
-                continue
-            values = parts[1:]
-            if len(values) != embedding_dim:
-                raise ValueError(
-                    f"GloVe row {line_number} has dimension {len(values)}, expected {embedding_dim}."
-                )
-            matrix[vocab.token_to_id[token]] = torch.tensor([float(value) for value in values], dtype=torch.float32)
-    matrix[vocab.pad_id].zero_()
-    return matrix
-
-
-def split_train_validation(
-    examples: Sequence[tuple[str, int]],
-    validation_fraction: float,
-    seed: int,
-) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    """Splits examples into train and validation subsets.
-
-    Args:
-        examples: Input examples.
-        validation_fraction: Fraction assigned to validation.
-        seed: Random seed.
-
-    Returns:
-        Train and validation example lists.
-
-    Raises:
-        ValueError: If ``validation_fraction`` is outside ``[0, 1)``.
-    """
-    if not 0 <= validation_fraction < 1:
-        raise ValueError("validation_fraction must be in [0, 1).")
-    shuffled = list(examples)
-    random.Random(seed).shuffle(shuffled)
-    val_size = int(len(shuffled) * validation_fraction)
-    return shuffled[val_size:], shuffled[:val_size]
-
-
-def iter_custom_text_batches(
-    texts: Sequence[str],
-    vocab: Vocabulary,
-    max_len: int,
-) -> Iterator[dict[str, torch.Tensor | list[list[str]]]]:
-    """Yields one encoded batch for custom text diagnostics.
-
-    Args:
-        texts: Raw texts to encode.
-        vocab: Vocabulary used for encoding.
-        max_len: Maximum token length.
-
-    Returns:
-        Iterator yielding a single batch dictionary.
-
-    Raises:
-        ValueError: If ``texts`` is empty.
-    """
-    if not texts:
-        raise ValueError("texts cannot be empty.")
-    ids_list: list[torch.Tensor] = []
-    mask_list: list[torch.Tensor] = []
-    tokens_list: list[list[str]] = []
-    for text in texts:
-        tokens = tokenize(text)
-        ids, mask = vocab.encode(tokens, max_len)
-        ids_list.append(torch.tensor(ids, dtype=torch.long))
-        mask_list.append(torch.tensor(mask, dtype=torch.float32))
-        tokens_list.append(tokens[:max_len])
-    yield {
-        "input_ids": torch.stack(ids_list),
-        "attention_mask": torch.stack(mask_list),
-        "tokens": tokens_list,
-    }
-
+    records: list[ReviewRecord] = []
+    for review, sentiment, split_name in rows:
+        label_name = sentiment.strip().lower()
+        if label_name not in config.LABEL_TO_INDEX:
+            raise ValueError(f"Unknown sentiment label: {sentiment}")
+        records.append(
+            ReviewRecord(
+                review=review,
+                label=config.LABEL_TO_INDEX[label_name],
+                split_name=split_name,
+            )
+        )
+    return records
