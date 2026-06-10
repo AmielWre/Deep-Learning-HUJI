@@ -72,28 +72,28 @@ class MaskedLogitAveraging(nn.Module):
         """
 
         expanded_mask = mask.unsqueeze(-1)
-        denominator = expanded_mask.sum(dim=1).clamp_min(1.0)
+        denominator = expanded_mask.sum(dim=1).clamp_min(1.0)  # The only tokens that contribute to the sum are real tokens (non-padding tokens), so we divide by their count.
         return (token_logits * expanded_mask).sum(dim=1) / denominator
 
 
 class ExRNN(nn.Module):
-    """Custom Elman RNN classifier implemented from first principles.
+    """Custom Elman RNN classifier.
 
     Args:
         input_size: Word embedding size.
-        output_size: Number of sentiment classes.
+        output_size: Number of sentiment (classification) classes.
         hidden_size: Recurrent hidden-state size.
     """
 
     def __init__(self, input_size: int, output_size: int, hidden_size: int) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.in2hidden = nn.Linear(input_size + hidden_size, hidden_size)
+        self.in2hidden = nn.Linear(input_size + hidden_size, hidden_size)  # size of input to calculate h_t = size of x_t + size of h_{t-1}
         self.classifier = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, output_size),
-        )
+        )  # The classifier is a simple 2-layer MLP that takes the final hidden state and produces class logits.
 
     def name(self) -> str:
         """Return a short model name."""
@@ -143,7 +143,7 @@ class ExGRU(nn.Module):
 
     Args:
         input_size: Word embedding size.
-        output_size: Number of sentiment classes.
+        output_size: Number of sentiment (classification) classes.
         hidden_size: Recurrent hidden-state size.
     """
 

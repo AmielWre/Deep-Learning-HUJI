@@ -1,49 +1,66 @@
-"""Dataset and text-vectorization utilities .
+"""Dataset and text-vectorization utilities.
 
-This file converts the raw IMDB CSV (or any other CSV with similar structure) into PyTorch batches ready for the models.
-The public entry point is ``get_data_loaders()``, which is called from
-``main.py``. The call flow is:
+This file converts the raw IMDB CSV into PyTorch DataLoaders ready for the
+models. The public entry point is ``get_data_loaders()``, which is called from
+``main.py``.
 
-``main.py`` -> ``get_data_loaders()`` -> ``load_records()`` -> ``_rows_to_records()``
--> ``ReviewRecord`` objects -> ``IMDBReviewDataset`` -> ``DataLoader`` ->
-``SentimentCollator`` -> ``Batch``.
+Call flow:
+    main.py
+    |_ get_data_loaders()
+       |- load_records()
+       |  |- pd.read_csv(config.DATASET_PATH)
+       |  |- optionally append config.CUSTOM_DIAGNOSTIC_REVIEWS with pd.concat()
+       |  |_ _rows_to_records()
+       |     |_ ReviewRecord(review, label, split_name)
+       |
+       |- TextVectorizer(config.EMBEDDING_SIZE, config.MAX_LENGTH)
+       |  |_ loads frozen GloVe vectors
+       |
+       |- IMDBReviewDataset(train_records / test_records)
+       |_ DataLoader(..., collate_fn=SentimentCollator(vectorizer))
+          |_ SentimentCollator.__call__()
+             |- clean_review()
+             |- tokenize(), applying config.MAX_LENGTH
+             |- TextVectorizer.encode(), applying padding and mask creation
+             |_ Batch(labels, embeddings, mask, tokens, split_names)
 
 Classes:
-    ``ReviewRecord``:
-        Stores one raw example: review text, numeric label, and ``split_name``.
-        This is for using record.review/label/split_name instead of record[0]/[1]/[2].
-        Normal IMDB rows use ``split_name="imdb"``; custom diagnostic rows use
-        names such as ``TP``, ``FN``, or ``NEGATION_POS`` so diagnostics can find
-        them later. See ``config.CUSTOM_DIAGNOSTIC_REVIEWS`` 
-    ``Batch``:
-        Stores one mini-batch returned by the DataLoader. It contains labels,
-        padded embeddings, padding masks, token lists, and split names.
-    ``TextVectorizer``:
-        The embedding maker.
-        Loads GloVe and converts token lists into fixed-size tensors. Short
+    ReviewRecord:
+        One raw example. It stores ``review`` text, numeric ``label``, and
+        ``split_name``. Normal IMDB rows use ``split_name="imdb"``; custom
+        rows use names like ``TP``, ``FN``, or ``NEGATION_POS`` so diagnostics
+        can find them later.
+    Batch:
+        One mini-batch returned by the DataLoader. It contains tensors used by
+        the model plus text metadata used by diagnostics.
+    TextVectorizer:
+        Converts token lists into fixed-size GloVe embedding tensors. Short
         reviews are padded with zero vectors here.
-    ``IMDBReviewDataset``:
-        A thin PyTorch ``Dataset`` wrapper around a list of ``ReviewRecord``
+    IMDBReviewDataset:
+        Thin PyTorch ``Dataset`` wrapper around a list of ``ReviewRecord``
         objects.
-    ``SentimentCollator``:
+    SentimentCollator:
         Converts a list of ``ReviewRecord`` objects into one ``Batch`` by
-        cleaning, tokenizing, embedding, padding, and stacking examples.
+        cleaning, tokenizing, embedding, padding, masking, and stacking.
 
 Shape conventions:
     labels:
-        ``[batch_size]`` integer labels, where 0 is negative and 1 is positive.
+        ``[config.BATCH_SIZE]`` for a full batch. Integer labels use
+        ``config.LABEL_TO_INDEX``: 0 is negative and 1 is positive.
     embeddings:
-        ``[batch_size, MAX_LENGTH, EMBEDDING_SIZE]``. With the assignment
-        default this is ``[batch_size, 100, 100]``.
+        ``[config.BATCH_SIZE, config.MAX_LENGTH, config.EMBEDDING_SIZE]`` for
+        a full batch.
     mask:
-        ``[batch_size, MAX_LENGTH]``. Real token positions are 1.0 and padding
-        positions are 0.0. Models use this mask to ignore padded zero vectors
-        during pooling or recurrent updates.
+        ``[config.BATCH_SIZE, config.MAX_LENGTH]`` for a full batch. Real token
+        positions are 1.0 and padding positions are 0.0. Models use this mask
+        to ignore padded zero vectors during pooling or recurrent updates.
 
-The ``MAX_LENGTH`` rule is applied in ``tokenize()`` with
-``split()[:max_length]``. Padding happens later in ``TextVectorizer.encode()``:
-it first creates zero tensors of length ``MAX_LENGTH``, then fills the first
-positions with GloVe vectors for the real tokens.
+Length rule and padding:
+    ``config.MAX_LENGTH`` is applied in ``tokenize()`` with
+    ``split()[:max_length]``. Padding happens later in
+    ``TextVectorizer.encode()``: it first creates zero tensors of length
+    ``config.MAX_LENGTH``, then fills the first positions with GloVe vectors
+    for the real tokens and sets matching mask entries to 1.0.
 """
 
 from __future__ import annotations

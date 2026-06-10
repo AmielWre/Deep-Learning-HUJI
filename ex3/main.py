@@ -1,15 +1,55 @@
 """Unified execution hub for Exercise 3 sentiment analysis.
 
-The file is intentionally organized as independent task blocks. Edit only the
-small block inside ``main()`` to choose the experiment you want to run:
-Task 1 RNN, Task 1 GRU, Task 2 isolated MLP, or Task 3/4 restricted local
-self-attention. All paths, hyperparameters, diagnostics, and device selection
-come from ``config.py`` so no command-line arguments are required.
+This file coordinates the whole practical pipeline: data loading, model
+selection, training, evaluation, plotting, checkpointing, and diagnostic
+printing. It intentionally reads no command-line arguments. To change an
+experiment, edit ``config.py`` or toggle the ``run`` values in ``main()``.
+
+Call flow:
+    main()
+    |- get_data_loaders()
+    |  |- load IMDB records and optional custom diagnostics
+    |  |_ create train_loader and test_loader
+    |
+    |- build the experiments list
+    |  |- ExRNN small / large
+    |  |- ExGRU small / large
+    |  |- ExMLP
+    |  |_ ExLRestSelfAtten
+    |
+    |_ for each active experiment
+       |_ run_experiment()
+          |- set_seed()
+          |- create a fresh model from its factory
+          |_ train_and_evaluate()
+             |- move model to config.DEVICE
+             |- try load_model_checkpoint()
+             |  |- if checkpoint exists and SKIP_TRAINING_IF_MODEL_EXISTS=True
+             |  |  |- evaluate on the test set
+             |  |  |_ print diagnostics
+             |  |_ otherwise continue to training
+             |
+             |- for each epoch
+             |  |- run_epoch(... train_loader ..., optimizer)
+             |  |_ run_epoch(... test_loader ..., optimizer=None)
+             |
+             |- save loss/accuracy plots
+             |- save model checkpoint when SAVE_MODELS=True
+             |_ print_diagnostics()
+
+Checkpoint behavior:
+    Models are saved to ``config.OUTPUT_DIR / f"{model.name()}.pth"``. When
+    ``LOAD_MODELS`` is true, existing weights are loaded before training. When
+    ``SKIP_TRAINING_IF_MODEL_EXISTS`` is also true, the script skips the slow
+    training loop and only runs test evaluation plus diagnostics. Set
+    ``SKIP_TRAINING_IF_MODEL_EXISTS=False`` to continue training from a saved
+    checkpoint.
 """
 
 from __future__ import annotations
 
 import random
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -75,6 +115,18 @@ def train_and_evaluate(
 
     model = model.to(config.DEVICE)
     criterion = nn.CrossEntropyLoss()
+    checkpoint_path = config.OUTPUT_DIR / f"{model.name()}.pth"
+    loaded_checkpoint = load_model_checkpoint(model, checkpoint_path)
+    if loaded_checkpoint and config.SKIP_TRAINING_IF_MODEL_EXISTS:
+        test_loss, test_acc = run_epoch(model, test_loader, criterion, optimizer=None)
+        print(
+            f"Using model: {model.name()} on {config.DEVICE} | "
+            f"loaded checkpoint, skipped training"
+        )
+        print(f"Test loss {test_loss:.4f}, acc {test_acc:.4f}")
+        print_diagnostics(model, test_loader)
+        return
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.LEARNING_RATE,
@@ -105,9 +157,27 @@ def train_and_evaluate(
     plot_path = config.OUTPUT_DIR / f"{model.name()}_curves.png"
     plot_training_history(history, plot_path)
     if config.SAVE_MODELS:
-        torch.save(model.state_dict(), config.OUTPUT_DIR / f"{model.name()}.pth")
+        torch.save(model.state_dict(), checkpoint_path)
     print(f"Saved curves to {plot_path}")
     print_diagnostics(model, test_loader)
+
+
+def load_model_checkpoint(model: nn.Module, checkpoint_path: Path) -> bool:
+    """Load existing model weights when configured to do so.
+
+    Args:
+        model: Model instance whose weights should be loaded.
+        checkpoint_path: Path to the saved ``state_dict``.
+
+    Returns:
+        ``True`` if a checkpoint was loaded, otherwise ``False``.
+    """
+
+    if not config.LOAD_MODELS or not checkpoint_path.exists():
+        return False
+    state_dict = torch.load(checkpoint_path, map_location=config.DEVICE)
+    model.load_state_dict(state_dict)
+    return True
 
 
 def run_epoch(
@@ -120,9 +190,9 @@ def run_epoch(
 
     Args:
         model: Sentiment model.
-        loader: DataLoader of batches.
+        loader: DataLoader of batches. Can be train_loader or test_loader.
         criterion: Loss function.
-        optimizer: Optimizer for training; ``None`` for evaluation.
+        optimizer: Optimizer for training; ``None`` for evaluation (test).
 
     Returns:
         Average loss and accuracy.
@@ -168,19 +238,45 @@ def print_diagnostics(model: nn.Module, test_loader: DataLoader[Batch]) -> None:
                 continue
             batch = batch.to(config.DEVICE)
             logits, token_scores, _ = model(batch.embeddings, batch.mask)
-            if token_scores is None:
+            if token_scores is None:  # meaning the model does not support diagnostics (RNN and GRU since they do not have per-token scores)
                 continue
             for index in diagnostic_indices:
-                print(f"\nDiagnostic sample: {batch.split_names[index]}")
+                target = int(batch.labels[index].item())
+                prediction = int(logits[index].argmax().item())
+                actual_outcome = diagnostic_outcome(target, prediction)
+                print(
+                    f"\nDiagnostic sample: intended {batch.split_names[index]} | "
+                    f"actual {actual_outcome}"
+                )
                 print_review(
                     batch.tokens[index],
                     token_scores[index],
                     logits[index],
-                    int(batch.labels[index].item()),
+                    target,
                 )
                 printed += 1
             if printed >= len(config.CUSTOM_DIAGNOSTIC_REVIEWS):
                 return
+
+
+def diagnostic_outcome(target: int, prediction: int) -> str:
+    """Return the TP/TN/FP/FN outcome for one binary prediction.
+
+    Args:
+        target: Ground-truth class index where 0 is negative and 1 is positive.
+        prediction: Predicted class index where 0 is negative and 1 is positive.
+
+    Returns:
+        One of ``TP``, ``TN``, ``FP``, or ``FN``.
+    """
+
+    if target == 1 and prediction == 1:
+        return "TP"
+    if target == 0 and prediction == 0:
+        return "TN"
+    if target == 0 and prediction == 1:
+        return "FP"
+    return "FN"
 
 
 def main() -> None:
@@ -196,21 +292,21 @@ def main() -> None:
     experiments = [
         # --- TASK 1: Custom Elman RNN ---
         {
-            "run": True,
+            "run": False,
             "factory": lambda: ExRNN(config.EMBEDDING_SIZE, config.OUTPUT_SIZE, config.SMALL_HIDDEN_SIZE),
         },
         {
-            "run": True,
+            "run": False,
             "factory": lambda: ExRNN(config.EMBEDDING_SIZE, config.OUTPUT_SIZE, config.LARGE_HIDDEN_SIZE),
         },
         
         # --- TASK 1: Custom GRU ---
         {
-            "run": True,
+            "run": False,
             "factory": lambda: ExGRU(config.EMBEDDING_SIZE, config.OUTPUT_SIZE, config.SMALL_HIDDEN_SIZE),
         },
         {
-            "run": True,
+            "run": False,
             "factory": lambda: ExGRU(config.EMBEDDING_SIZE, config.OUTPUT_SIZE, config.LARGE_HIDDEN_SIZE),
         },
         

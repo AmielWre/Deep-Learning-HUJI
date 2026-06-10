@@ -1,4 +1,41 @@
-"""Visualization and diagnostic helpers for Exercise 3."""
+"""Visualization and diagnostic helpers.
+
+This file contains small utilities used by ``main.py`` after or during model
+execution. It does not load data and does not define models; it only evaluates
+predictions, saves plots, and prints readable diagnostic tables.
+
+Call flow:
+    main.py
+    |- run_epoch()
+    |  |_ accuracy_from_logits()
+    |     |- receives logits shaped ``[batch_size, config.OUTPUT_SIZE]``
+    |     |_ compares argmax predictions to labels shaped ``[batch_size]``
+    |
+    |- train_and_evaluate()
+    |  |_ plot_training_history()
+    |     |- receives train/test loss and accuracy lists
+    |     |_ saves the curves under config.OUTPUT_DIR
+    |
+    |_ print_diagnostics()
+       |_ print_review()
+          |- receives tokens for one review
+          |- receives token_scores shaped
+          |  ``[config.MAX_LENGTH, config.OUTPUT_SIZE]``
+          |- receives review logits shaped ``[config.OUTPUT_SIZE]``
+          |_ prints per-token negative/positive logits plus global probabilities
+
+Shape conventions:
+    logits:
+        Review-level model outputs shaped ``[batch_size, config.OUTPUT_SIZE]``.
+    labels:
+        Integer targets shaped ``[batch_size]`` using ``config.LABEL_TO_INDEX``.
+    token_scores:
+        Per-word logits shaped ``[config.MAX_LENGTH, config.OUTPUT_SIZE]`` for
+        one review. These exist for the MLP and attention models.
+    probabilities:
+        Softmax-normalized review probabilities shaped ``[config.OUTPUT_SIZE]``.
+        They are used only for diagnostics and display, not for training loss.
+"""
 
 from __future__ import annotations
 
@@ -74,7 +111,7 @@ def print_review(
     scores = token_scores.detach().cpu()
     prediction = int(probabilities.argmax().item())
     print("\nReview diagnostic")
-    print(f"Target: {config.INDEX_TO_LABEL[target]} | Prediction: {config.INDEX_TO_LABEL[prediction]}")
+    # print(f"Target: {config.INDEX_TO_LABEL[target]} | Prediction: {config.INDEX_TO_LABEL[prediction]}")
     print(f"P(negative): {probabilities[0]:.4f} | P(positive): {probabilities[1]:.4f}")
     print("-" * 58)
     print(f"{'idx':>3}  {'token':<22} {'neg_logit':>10} {'pos_logit':>10}")
